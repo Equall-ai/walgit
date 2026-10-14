@@ -394,8 +394,7 @@ pub async fn run(
     log(format!(
         "pack lifecycle {work:?}: capturing {bytes} committed bytes in isolated scratch"
     ));
-    drop(handle.sync_full().await?);
-    let current = handle.publication_view().await?;
+    let (current, pin) = handle.materialized_publication_view().await?;
     let cpu = std::thread::available_parallelism().map_or(1, usize::from);
     let memory = if budget == 0 {
         cfg.packs.segment_delta_window_memory.as_u64()
@@ -477,6 +476,7 @@ pub async fn run(
         }
     }
     let (mut journal, captured, mut physical) = if let Some(value) = restored {
+        drop(pin);
         value
     } else {
         let selected = match &work {
@@ -495,7 +495,6 @@ pub async fn run(
             _ => 2,
         };
         let global = matches!(work, Work::FirstFreeze | Work::Resegment);
-        let pin = handle.pin_local_objects().await;
         let mut input = maintenance_input::prepare(
             handle.local().path().to_path_buf(),
             root,

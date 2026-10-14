@@ -2642,12 +2642,11 @@ async fn check_lost_response_retry_412(deny_deletes: bool) -> Result<()> {
         c.instances[0].link.stats().cas_fail.load(Ordering::Relaxed) > 0,
         "fault was not exercised"
     );
-    if deny_deletes {
-        ensure!(
-            c.instances[0].link.stats().denied.load(Ordering::Relaxed) > 0,
-            "delete policy was not exercised"
-        );
-    }
+    ensure!(
+        acked,
+        "readback must acknowledge the committed push: {:?}",
+        p.errors
+    );
     c.instances[0].link.heal();
     let head = c.truth_manifest().await?.head_seq;
     eprintln!("truth head after lost response: {head}");
@@ -2752,12 +2751,12 @@ async fn reliability_maintenance_lost_response_with_delete_denied() -> Result<()
                     &walgit_server::ops::noop_log,
                 )
                 .await
-                .map(|_| ())
-                .map_err(anyhow::Error::from),
+                .map(|_| ()),
             }
         })
         .await;
         eprintln!("{operation} with applied-write 412: {result:?}");
+        result.with_context(|| format!("{operation} timed out"))??;
         ensure!(
             c.instances[1].link.stats().cas_fail.load(Ordering::Relaxed) > 0,
             "{operation} did not exercise fault"
@@ -2787,22 +2786,22 @@ async fn reliability_maintenance_lost_response_with_delete_denied() -> Result<()
 /// Two stale proposals for the same ref must produce exactly one acknowledged winner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reliability_same_ref_has_one_winner() -> Result<()> {
-    let c = Cluster::new(91, 2).await?;
+    let cluster = Cluster::new(91, 2).await?;
     let mut left = Pusher::new(0);
     let mut right = Pusher::new(1);
     ensure!(
-        left.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+        left.push_once(&cluster.instances[0], &cluster.id, Duration::from_secs(10))
             .await?
     );
     ensure!(
         right
-            .push_once(&c.instances[1], &c.id, Duration::from_secs(10))
+            .push_once(&cluster.instances[1], &cluster.id, Duration::from_secs(10))
             .await?
     );
-    let a = c.instances[0].open(&c.id).await?;
-    let b = c.instances[1].open(&c.id).await?;
-    drop(a.sync_full().await?);
-    drop(b.sync_full().await?);
+    let left_node = cluster.instances[0].open(&cluster.id).await?;
+    let right_node = cluster.instances[1].open(&cluster.id).await?;
+    drop(left_node.sync_full().await?);
+    drop(right_node.sync_full().await?);
     for round in 0..12 {
         let name = format!("refs/heads/race-{round}");
         let proposal = |tip: &str| RefTransaction {
@@ -2815,20 +2814,23 @@ async fn reliability_same_ref_has_one_winner() -> Result<()> {
             atomic: true,
             ..Default::default()
         };
-        let (x, y) = tokio::join!(
-            a.publish_push(None, proposal(&left.tip), HashMap::new()),
-            b.publish_push(None, proposal(&right.tip), HashMap::new()),
+        let (left_result, right_result) = tokio::join!(
+            left_node.publish_push(None, proposal(&left.tip), HashMap::new()),
+            right_node.publish_push(None, proposal(&right.tip), HashMap::new()),
         );
-        let x = x?;
-        let y = y?;
-        let x_won = x.per_ref.iter().all(|(_, result)| result.is_ok());
-        let y_won = y.per_ref.iter().all(|(_, result)| result.is_ok());
+        let left_result = left_result?;
+        let right_result = right_result?;
+        let x_won = left_result.per_ref.iter().all(|(_, result)| result.is_ok());
+        let y_won = right_result
+            .per_ref
+            .iter()
+            .all(|(_, result)| result.is_ok());
         ensure!(
             x_won != y_won,
             "expected one winner: left={x_won}, right={y_won}"
         );
         let expected = if x_won { &left.tip } else { &right.tip };
-        for h in [&a, &b] {
+        for h in [&left_node, &right_node] {
             drop(h.sync_refs().await?);
             let actual = h
                 .local()
@@ -2843,7 +2845,7 @@ async fn reliability_same_ref_has_one_winner() -> Result<()> {
             );
         }
     }
-    check_truth(&c, &[left, right]).await
+    check_truth(&cluster, &[left, right]).await
 }
 
 /// Concurrent pushes and maintenance survive repeated ambiguous commits and loss of every cache.
@@ -2886,7 +2888,6 @@ async fn reliability_mixed_faults_maintenance_and_cache_loss() -> Result<()> {
                 )
                 .await
                 .map(|_| ())
-                .map_err(anyhow::Error::from)
             }),
         );
         eprintln!(
@@ -2978,4 +2979,73 @@ async fn reliability_compaction_alongside_healthy_pushes() -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// A checkpoint can erase readback evidence without making an applied push safe to delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reliability_checkpoint_folds_ambiguous_push_before_readback() -> Result<()> {
+    let c = Cluster::new(113, 2).await?;
+    let mut p = Pusher::new(0);
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    c.instances[0].link.set(
+        FaultPlan {
+            cas_fail_after_apply: true,
+            ..Default::default()
+        }
+        .with_only(&["manifest.pb"]),
+    );
+    let gate = c.instances[0].link.gate_next("after_put", "manifest.pb");
+    let writer = Instance {
+        name: "paused-writer".into(),
+        link: c.instances[0].link.clone(),
+        registry: c.instances[0].registry.clone(),
+        cfg: c.instances[0].cfg.clone(),
+        cache: tempfile::tempdir()?,
+    };
+    let id = c.id.clone();
+    let pending = tokio::spawn(async move {
+        let result = p.push_once(&writer, &id, Duration::from_secs(20)).await;
+        (p, result)
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await?;
+    let committed = c.truth_manifest().await?;
+    let segment = committed
+        .log_segments
+        .last()
+        .context("missing committed segment")?
+        .key
+        .clone();
+    let reader = c.instances[1].open(&c.id).await?;
+    let checkpoint = reader.write_checkpoint().await?;
+    ensure!(checkpoint.seq == committed.head_seq);
+    ensure!(
+        !c.truth_manifest()
+            .await?
+            .log_segments
+            .iter()
+            .any(|s| s.key == segment),
+        "test did not fold the evidence"
+    );
+    gate.release();
+    let (mut p, outcome) = tokio::time::timeout(Duration::from_secs(25), pending).await??;
+    eprintln!(
+        "checkpoint-folded push: acknowledged={}, errors={:?}",
+        outcome?, p.errors
+    );
+    c.instances[0].link.heal();
+    ensure!(
+        c.truth
+            .exists(&format!("{}{segment}", c.repo_prefix()))
+            .await?,
+        "ambiguous committed segment was deleted"
+    );
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    check_truth(&c, std::slice::from_ref(&p)).await
 }

@@ -294,6 +294,25 @@ impl FaultStore {
         }
     }
 
+    /// Pause a selected operation boundary for deterministic interleaving tests.
+    async fn wait_gate(&self, op: &str, key: &str) {
+        let gate = {
+            let mut pending = self.gate.lock();
+            if pending
+                .as_ref()
+                .is_some_and(|(operation, pattern, _)| operation == op && key.contains(pattern))
+            {
+                pending.take().map(|(_, _, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Roll the dice for one op. `mutation`: put/delete/compose; `conditional`:
     /// CAS put/delete or if-none-match get; `body_len`: for truncation.
     #[expect(
@@ -312,21 +331,7 @@ impl FaultStore {
         conditional: bool,
         read_body: bool,
     ) -> Decision {
-        let gate = {
-            let mut pending = self.gate.lock();
-            if pending
-                .as_ref()
-                .is_some_and(|(operation, pattern, _)| operation == op && key.contains(pattern))
-            {
-                pending.take().map(|(_, _, gate)| gate)
-            } else {
-                None
-            }
-        };
-        if let Some(gate) = gate {
-            gate.entered.notify_one();
-            gate.release.notified().await;
-        }
+        self.wait_gate(op, key).await;
         self.stats.ops.fetch_add(1, Ordering::Relaxed);
         let plan = self.plan.lock().clone();
         if let Some(p) = plan
@@ -495,6 +500,7 @@ impl ObjectStore for FaultStore {
         let plan = self.plan();
         if conditional && plan.cas_fail_after_apply && Self::in_scope(&plan, key) {
             let meta = self.inner.put(key, body, opts).await?;
+            self.wait_gate("after_put", key).await;
             self.stats.cas_fail.fetch_add(1, Ordering::Relaxed);
             return Err(StoreError::PreconditionFailed {
                 key: key.into(),
