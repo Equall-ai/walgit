@@ -1007,6 +1007,71 @@ mod tests {
     use aws_sdk_s3::error::SdkError;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
     use aws_sdk_s3::operation::put_object::PutObjectError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stale lease releaser must not delete a replacement installed after HEAD.
+    #[tokio::test]
+    async fn reliability_conditional_delete_preserves_replacement() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // HEAD observes old; another writer replaces the lease before DELETE arrives.
+            for method in ["HEAD", "DELETE"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "request ended before headers");
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8_lossy(&request).to_lowercase();
+                assert!(request.starts_with(&method.to_lowercase()));
+                if method == "HEAD" {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nETag: \"old\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                let protected = request
+                    .lines()
+                    .any(|line| line.starts_with("if-match:") && line.contains("old"));
+                let status = if protected {
+                    "412 Precondition Failed"
+                } else {
+                    "204 No Content"
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                return protected;
+            }
+            unreachable!()
+        });
+        let store = S3Store {
+            client: client_for(&endpoint),
+            bucket: "test".into(),
+            http: reqwest::Client::new(),
+            multipart_threshold: u64::MAX,
+            multipart_part_size: 8 * 1024 * 1024,
+        };
+        let result = store
+            .delete(
+                "repos/test/repo/leases/compact.pb",
+                Some(Version::new("old")),
+            )
+            .await;
+        let replacement_survived = server.await.unwrap();
+        assert!(
+            replacement_survived,
+            "stale releaser deleted replacement lease; delete result: {result:?}"
+        );
+        assert!(matches!(result, Err(StoreError::PreconditionFailed { .. })));
+    }
 
     /// A fake S3 that answers every request with one status and error code.
     /// Bound on an ephemeral port; the accept loop dies with the test runtime.

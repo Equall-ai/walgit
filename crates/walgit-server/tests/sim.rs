@@ -197,6 +197,9 @@ impl Instance {
         let cfg = Arc::new(cfg);
         let link = FaultStore::new(truth.clone(), name, seed);
         link.set_trace(true);
+        if std::env::var_os("WALGIT_SIM_DENY_LOG_DELETE").is_some() {
+            link.deny_deletes(vec!["/log/".into()]);
+        }
         let registry = Registry::new(link.clone() as DynStore, cfg.clone());
         Instance {
             name: name.to_string(),
@@ -627,10 +630,48 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
             "observer lacks tip {oid} of {name} after full sync"
         );
     }
+    // Validate complete Git object connectivity, including history folded into checkpoints.
+    let path = handle.local().path().to_path_buf();
+    let ancestry: Vec<_> = pushers
+        .iter()
+        .flat_map(|p| {
+            let tip = folded.get(&p.refname).cloned();
+            p.acked
+                .iter()
+                .filter_map(move |a| tip.clone().map(|tip| (a.new.clone(), tip)))
+        })
+        .collect();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let fsck = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["fsck", "--full", "--no-reflogs"])
+            .output()?;
+        ensure!(
+            fsck.status.success(),
+            "cold fsck failed: {}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+        for (ack, tip) in ancestry {
+            let result = Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(["merge-base", "--is-ancestor", &ack, &tip])
+                .output()?;
+            ensure!(
+                result.status.success(),
+                "acknowledged {ack} is not an ancestor of {tip}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        Ok(())
+    })
+    .await??;
     Ok(())
 }
 
-/// Liveness of the core: pushes ACK, syncs converge, maintenance completes,
+/// Liveness of the core:
+/// Pushes ACK, syncs converge, maintenance completes,
 /// a cold instance comes up. `bound` is the wall-clock budget per step.
 async fn check_core_liveness(
     c: &mut Cluster,
@@ -1284,10 +1325,12 @@ async fn liveness_orphaned_log_segment_does_not_block_writers() -> Result<()> {
         matches!(out, walgit_server::ops::CompactOutcome::Published { .. }),
         "{out:?}"
     );
-    // The orphan was swept.
+    // A deny policy retains garbage; either policy must preserve committed data.
+    let retained = c.truth.exists(&orphan).await?;
+    let deletion_denied = std::env::var_os("WALGIT_SIM_DENY_LOG_DELETE").is_some();
     ensure!(
-        !c.truth.exists(&orphan).await?,
-        "orphan {orphan} still in the bucket after a commit burned past it"
+        retained == deletion_denied,
+        "unexpected orphan retention under delete policy"
     );
     check_truth(&c, std::slice::from_ref(&p)).await?;
     Ok(())
@@ -2565,5 +2608,374 @@ async fn checkpoint_retry_never_regresses_a_newer_checkpoint() -> Result<()> {
     );
     ensure!(c.truth_manifest().await?.checkpoint == Some(checkpoint));
     check_truth(&c, std::slice::from_ref(&p)).await?;
+    Ok(())
+}
+
+/// Check committed state after an applied manifest write surfaces as 412.
+async fn check_lost_response_retry_412(deny_deletes: bool) -> Result<()> {
+    let mut c = Cluster::new(14, 2).await?;
+    let mut p = Pusher::new(0);
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    c.instances[0].link.set(
+        FaultPlan {
+            cas_fail_after_apply: true,
+            deny_delete_keys: if deny_deletes {
+                vec!["/log/".into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }
+        .with_only(&["manifest.pb"]),
+    );
+    let acked = p
+        .push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+        .await?;
+    eprintln!(
+        "push with lost CAS response: acked={acked}, last error {:?}",
+        p.errors.last()
+    );
+    ensure!(
+        c.instances[0].link.stats().cas_fail.load(Ordering::Relaxed) > 0,
+        "fault was not exercised"
+    );
+    if deny_deletes {
+        ensure!(
+            c.instances[0].link.stats().denied.load(Ordering::Relaxed) > 0,
+            "delete policy was not exercised"
+        );
+    }
+    c.instances[0].link.heal();
+    let head = c.truth_manifest().await?.head_seq;
+    eprintln!("truth head after lost response: {head}");
+    // Everyone, including a cold instance, must be able to sync.
+    let r = check_truth(&c, std::slice::from_ref(&p)).await;
+    if let Err(e) = &r {
+        eprintln!("{}", c.dump_traces());
+        bail!("truth inconsistent after a lost CAS response: {e:#}");
+    }
+    let cold = c.add_instance("cold", &|_| {});
+    let h = c.instances[cold].open(&c.id).await?;
+    tokio::time::timeout(Duration::from_secs(10), h.sync_full())
+        .await
+        .map_err(|_| anyhow!("cold sync hung"))??;
+    ensure!(
+        h.applied_seq() == head,
+        "cold at {} != {head}",
+        h.applied_seq()
+    );
+    // And the writer itself keeps working.
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?,
+        "writer wedged: {:?}",
+        p.errors.last()
+    );
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+    Ok(())
+}
+
+/// An applied manifest write must survive the SDK retry returning 412.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_response_retry_412_preserves_committed_data() -> Result<()> {
+    check_lost_response_retry_412(false).await
+}
+
+/// Denying log deletes must preserve readability despite the false conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_response_retry_412_with_log_delete_denied() -> Result<()> {
+    check_lost_response_retry_412(true).await
+}
+
+/// Concurrent writers on separate nodes preserve both independent branches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reliability_two_writers_preserve_acknowledged_pushes() -> Result<()> {
+    let c = Cluster::new(41, 2).await?;
+    let mut left = Pusher::new(0);
+    let mut right = Pusher::new(1);
+    for _ in 0..8 {
+        let (a, b) = tokio::join!(
+            left.push_once(&c.instances[0], &c.id, Duration::from_secs(10)),
+            right.push_once(&c.instances[1], &c.id, Duration::from_secs(10)),
+        );
+        ensure!(a?, "left writer failed: {:?}", left.errors);
+        ensure!(b?, "right writer failed: {:?}", right.errors);
+    }
+    check_truth(&c, &[left, right]).await
+}
+
+/// Exercise every maintenance publisher under an applied-write 412 with log deletion denied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reliability_maintenance_lost_response_with_delete_denied() -> Result<()> {
+    for operation in ["settings", "checkpoint", "compaction"] {
+        let mut c = Cluster::new(73, 2).await?;
+        for instance in &c.instances {
+            instance.link.deny_deletes(vec!["/log/".into()]);
+        }
+        let mut p = Pusher::new(0);
+        for _ in 0..5 {
+            ensure!(
+                p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+                    .await?
+            );
+        }
+        let h = c.instances[1].open(&c.id).await?;
+        drop(h.sync_full().await?);
+        c.instances[1].link.set(
+            FaultPlan {
+                cas_fail_after_apply: true,
+                ..Default::default()
+            }
+            .with_only(&["manifest.pb"]),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            match operation {
+                "settings" => h
+                    .publish_settings("", "test", "lost reply")
+                    .await
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from),
+                "checkpoint" => h
+                    .write_checkpoint()
+                    .await
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from),
+                _ => walgit_server::ops::compact_repo(
+                    &h,
+                    walgit_server::ops::CompactRequest {
+                        force: true,
+                        rebuild_base: false,
+                    },
+                    &walgit_server::ops::noop_log,
+                )
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from),
+            }
+        })
+        .await;
+        eprintln!("{operation} with applied-write 412: {result:?}");
+        ensure!(
+            c.instances[1].link.stats().cas_fail.load(Ordering::Relaxed) > 0,
+            "{operation} did not exercise fault"
+        );
+        c.instances[1].link.heal();
+        check_truth(&c, std::slice::from_ref(&p))
+            .await
+            .context(operation)?;
+        drop(h);
+        for i in 0..2 {
+            c.restart(i);
+            c.instances[i].link.deny_deletes(vec!["/log/".into()]);
+        }
+        ensure!(
+            p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+                .await?,
+            "{operation} wedged writer: {:?}",
+            p.errors
+        );
+        check_truth(&c, std::slice::from_ref(&p))
+            .await
+            .context(operation)?;
+    }
+    Ok(())
+}
+
+/// Two stale proposals for the same ref must produce exactly one acknowledged winner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reliability_same_ref_has_one_winner() -> Result<()> {
+    let c = Cluster::new(91, 2).await?;
+    let mut left = Pusher::new(0);
+    let mut right = Pusher::new(1);
+    ensure!(
+        left.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    ensure!(
+        right
+            .push_once(&c.instances[1], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    let a = c.instances[0].open(&c.id).await?;
+    let b = c.instances[1].open(&c.id).await?;
+    drop(a.sync_full().await?);
+    drop(b.sync_full().await?);
+    for round in 0..12 {
+        let name = format!("refs/heads/race-{round}");
+        let proposal = |tip: &str| RefTransaction {
+            updates: vec![RefUpdate {
+                name: name.clone(),
+                old_oid: String::new(),
+                new_oid: tip.into(),
+                ..Default::default()
+            }],
+            atomic: true,
+            ..Default::default()
+        };
+        let (x, y) = tokio::join!(
+            a.publish_push(None, proposal(&left.tip), HashMap::new()),
+            b.publish_push(None, proposal(&right.tip), HashMap::new()),
+        );
+        let x = x?;
+        let y = y?;
+        let x_won = x.per_ref.iter().all(|(_, result)| result.is_ok());
+        let y_won = y.per_ref.iter().all(|(_, result)| result.is_ok());
+        ensure!(
+            x_won != y_won,
+            "expected one winner: left={x_won}, right={y_won}"
+        );
+        let expected = if x_won { &left.tip } else { &right.tip };
+        for h in [&a, &b] {
+            drop(h.sync_refs().await?);
+            let actual = h
+                .local()
+                .refs()?
+                .refs
+                .into_iter()
+                .find(|r| r.name == name)
+                .map(|r| r.oid);
+            ensure!(
+                actual.as_ref() == Some(expected),
+                "winner not visible on both nodes"
+            );
+        }
+    }
+    check_truth(&c, &[left, right]).await
+}
+
+/// Concurrent pushes and maintenance survive repeated ambiguous commits and loss of every cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reliability_mixed_faults_maintenance_and_cache_loss() -> Result<()> {
+    let mut c = Cluster::new(97, 3).await?;
+    let mut left = Pusher::new(0);
+    let mut right = Pusher::new(1);
+    for round in 0..16 {
+        for instance in &c.instances {
+            instance.link.deny_deletes(vec!["/log/".into()]);
+        }
+        let maintenance = c.instances[2].open(&c.id).await?;
+        c.instances[0].link.set(
+            FaultPlan {
+                cas_fail_after_apply: round % 3 == 0,
+                p_err_after: if round % 3 == 1 { 1.0 } else { 0.0 },
+                ..Default::default()
+            }
+            .with_only(&["manifest.pb"]),
+        );
+        let (a, b, m) = tokio::join!(
+            left.push_once(&c.instances[0], &c.id, Duration::from_secs(10)),
+            right.push_once(&c.instances[1], &c.id, Duration::from_secs(10)),
+            tokio::time::timeout(Duration::from_secs(20), async {
+                if round % 2 == 0 {
+                    return maintenance
+                        .write_checkpoint()
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from);
+                }
+                walgit_server::ops::compact_repo(
+                    &maintenance,
+                    walgit_server::ops::CompactRequest {
+                        force: true,
+                        rebuild_base: false,
+                    },
+                    &walgit_server::ops::noop_log,
+                )
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+            }),
+        );
+        eprintln!(
+            "mixed round {round}: writer A={:?}, writer B={:?}, maintenance={m:?}",
+            a?, b?
+        );
+        c.instances[0].link.heal();
+        check_truth(&c, &[]).await?;
+        drop(maintenance);
+        if round % 4 == 3 {
+            for i in 0..3 {
+                c.restart(i);
+            }
+        }
+    }
+    ensure!(
+        !left.acked.is_empty() && !right.acked.is_empty(),
+        "both writers must make progress"
+    );
+    eprintln!(
+        "mixed workload acknowledgements: left={}, right={}",
+        left.acked.len(),
+        right.acked.len()
+    );
+    check_truth(&c, &[left, right]).await
+}
+
+/// A cold maintenance node must compact committed packs without a caller warming its cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reliability_cold_maintenance_can_compact() -> Result<()> {
+    let c = Cluster::new(101, 2).await?;
+    let mut p = Pusher::new(0);
+    for _ in 0..5 {
+        ensure!(
+            p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+                .await?
+        );
+    }
+    let cold = c.instances[1].open(&c.id).await?;
+    let outcome = walgit_server::ops::compact_repo(
+        &cold,
+        walgit_server::ops::CompactRequest {
+            force: true,
+            rebuild_base: false,
+        },
+        &|line| eprintln!("cold maintenance: {line}"),
+    )
+    .await;
+    // Always check data even if maintenance fails.
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+    ensure!(
+        matches!(
+            outcome?,
+            walgit_server::ops::CompactOutcome::Published { .. }
+        ),
+        "cold maintenance did not publish"
+    );
+    Ok(())
+}
+
+/// Maintenance alongside healthy pushes must not fail because a local pack file disappears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reliability_compaction_alongside_healthy_pushes() -> Result<()> {
+    let c = Cluster::new(107, 2).await?;
+    let mut p = Pusher::new(0);
+    for _ in 0..5 {
+        ensure!(
+            p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+                .await?
+        );
+    }
+    let maintainer = c.instances[1].open(&c.id).await?;
+    for round in 0..16 {
+        let (pushed, compacted) = tokio::join!(
+            p.push_once(&c.instances[0], &c.id, Duration::from_secs(10)),
+            walgit_server::ops::compact_repo(
+                &maintainer,
+                walgit_server::ops::CompactRequest {
+                    force: true,
+                    rebuild_base: false
+                },
+                &|line| eprintln!("concurrent maintenance: {line}")
+            ),
+        );
+        check_truth(&c, std::slice::from_ref(&p)).await?;
+        ensure!(pushed?, "healthy push failed: {:?}", p.errors);
+        compacted.with_context(|| {
+            format!("maintenance failed alongside healthy push in round {round}")
+        })?;
+    }
     Ok(())
 }
