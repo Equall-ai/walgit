@@ -21,10 +21,8 @@
 //!
 //! ## Conditional DELETE
 //!
-//! S3 has no native conditional delete. We emulate via HEAD (read `ETag`) +
-//! compare + DELETE, documenting the inherent check-then-act race: a
-//! concurrent writer could replace the object between HEAD and DELETE.
-//! Acceptable for walgit's lease-guarded semantics.
+//! Conditional deletes use native If-Match, so checking the version and deleting
+//! the object are one atomic operation in the store.
 //!
 //! ## Multipart upload
 //!
@@ -425,30 +423,11 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
-            // S3 has no conditional delete: emulate via HEAD + compare + DELETE.
-            // RACE: a concurrent writer could replace the object between HEAD
-            // and DELETE. Acceptable for walgit's lease-guarded semantics.
-            let head = self.head(key).await?;
-            match head {
-                None => return Err(StoreError::NotFound { key: key.into() }),
-                Some(meta) if &meta.version != want => {
-                    return Err(StoreError::PreconditionFailed {
-                        key: key.into(),
-                        current: Some(meta.version),
-                    });
-                }
-                _ => {}
-            }
+            request = request.if_match(format!("\"{}\"", want.as_str().trim_matches('"')));
         }
-
-        let resp = self
-            .client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await;
+        let resp = request.send().await;
 
         match resp {
             Ok(_) => Ok(()),
@@ -465,6 +444,15 @@ impl ObjectStore for S3Store {
                     {
                         return Ok(());
                     }
+                }
+                if err
+                    .raw_response()
+                    .is_some_and(|response| response.status().as_u16() == 412)
+                {
+                    return Err(StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current: None,
+                    });
                 }
                 Err(classify_error("s3 delete error", &err))
             }
@@ -1007,6 +995,71 @@ mod tests {
     use aws_sdk_s3::error::SdkError;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
     use aws_sdk_s3::operation::put_object::PutObjectError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stale lease releaser must not delete a replacement installed after HEAD.
+    #[tokio::test]
+    async fn reliability_conditional_delete_preserves_replacement() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // HEAD observes old; another writer replaces the lease before DELETE arrives.
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "request ended before headers");
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8_lossy(&request).to_lowercase();
+                assert!(request.starts_with("head ") || request.starts_with("delete "));
+                if request.starts_with("head ") {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nETag: \"old\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                let protected = request
+                    .lines()
+                    .any(|line| line.starts_with("if-match:") && line.contains("old"));
+                let status = if protected {
+                    "412 Precondition Failed"
+                } else {
+                    "204 No Content"
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                return protected;
+            }
+            unreachable!()
+        });
+        let store = S3Store {
+            client: client_for(&endpoint),
+            bucket: "test".into(),
+            http: reqwest::Client::new(),
+            multipart_threshold: u64::MAX,
+            multipart_part_size: 8 * 1024 * 1024,
+        };
+        let result = store
+            .delete(
+                "repos/test/repo/leases/compact.pb",
+                Some(Version::new("old")),
+            )
+            .await;
+        let replacement_survived = server.await.unwrap();
+        assert!(
+            replacement_survived,
+            "stale releaser deleted replacement lease; delete result: {result:?}"
+        );
+        assert!(matches!(result, Err(StoreError::PreconditionFailed { .. })));
+    }
 
     /// A fake S3 that answers every request with one status and error code.
     /// Bound on an ephemeral port; the accept loop dies with the test runtime.

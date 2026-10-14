@@ -376,7 +376,7 @@ impl RepoHandle {
         snapshots: &[CoverageSnapshot],
         lease: &tokio::sync::Mutex<walgit_store::coord::LeaseGuard>,
     ) -> Result<u64, WalError> {
-        use crate::publish::{ClaimOutcome, claim_log_slot, drop_own_slot, sweep_burned};
+        use crate::publish::{ClaimOutcome, claim_log_slot, sweep_burned};
         use walgit_proto::v1::{EntryKind, LogEntry, LogSegmentRef};
         use walgit_proto::{frame, keys, time};
         if inputs.is_empty() || outputs.is_empty() || inputs.len() > 4096 || outputs.len() > 4096 {
@@ -526,14 +526,8 @@ impl RepoHandle {
                     mode.into(),
                 )
                 .await;
-            let committed = match result {
-                Ok(meta) => Some((updated, meta.version)),
-                Err(StoreError::PreconditionFailed { .. }) => None,
-                Err(error) => match crate::publish::cas_landed(&self.store, &slot).await? {
-                    Some(pair) => Some(pair),
-                    None => return Err(error.into()),
-                },
-            };
+            let committed =
+                crate::publish::resolve_manifest_cas(&self.store, &slot, updated, result).await?;
             if let Some((committed, version)) = committed {
                 let _sync = self.sync_mutex.lock().await;
                 let applied = self.state.lock().applied_seq;
@@ -554,7 +548,6 @@ impl RepoHandle {
                 sweep_burned(&self.store, &slot).await;
                 return Ok(seq);
             }
-            drop_own_slot(&self.store, &slot).await;
             tokio::time::sleep(std::time::Duration::from_millis(5 + u64::from(attempt) * 7)).await;
         }
         Err(WalError::Retry {

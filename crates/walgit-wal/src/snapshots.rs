@@ -215,6 +215,28 @@ impl RepoHandle {
         })
     }
 
+    /// Capture a fully downloaded generation and pin its files until the consumer finishes.
+    pub async fn materialized_publication_view(
+        &self,
+    ) -> Result<(PublicationView, tokio::sync::OwnedRwLockReadGuard<()>), WalError> {
+        for _ in 0..self.cfg.wal.cas_max_retries {
+            let guard = self.sync_full().await?;
+            let view = self.publication_view().await?;
+            if self.state.lock().packs_revision != view.manifest.revision {
+                drop(guard);
+                continue;
+            }
+            // Do not queue a second read behind a writer while holding the first.
+            if let Ok(pin) = self.rw.clone().try_read_owned() {
+                return Ok((view, pin));
+            }
+            drop(guard);
+        }
+        Err(WalError::Retry {
+            attempts: self.cfg.wal.cas_max_retries,
+        })
+    }
+
     /// Upload immutable refs prepared from a coherent committed producer view.
     pub async fn prepare_coverage_snapshot(
         &self,

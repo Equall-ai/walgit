@@ -145,7 +145,7 @@ receive-pack (ours, `walgit-git/src/receive.rs`) → index the pack locally (`gi
 --keep --rev-index --threads=0`, `--fsck-objects` when `wal.fsck_objects`) in a per-ingest scratch git dir (a
 rejected push leaves nothing behind) → connectivity per config (`spawn_blocking`) → **push policy**
 (`docs/POLICY.md`) → `pack PUT ∥ idx PUT ∥ log PUT` → **manifest CAS** (group commit per repo per instance,
-`wal.batch_window`) → commit local ref txn → `ok` to the client. On 412: refetch, re-validate every old value
+`wal.batch_window`) → commit local ref txn → `ok` to the client. On any manifest error, including 412, read back the exact claimed segment before retrying. Never delete a segment merely because readback cannot prove it committed. On an unresolved 412: refetch, re-validate every old value
 (moved ref ⇒ `ng`), re-seq, retry with jittered backoff. **Who writes (D28): the host that maintains a repo.**
 Hosts that maintain nothing may forward receive-pack to a **push broker** (`wal.push_broker_url`) so one warm
 writer batches the CAS; fallback to the local path if the broker is down. Publish is CAS-safe, so disjoint writer
@@ -487,7 +487,15 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
+- **D50 (2026-10-14): Failed manifest responses do not prove rejection.** Push, compaction,
+  settings and replacement seals share exact-segment readback after all errors, including 412.
+  Keep uncertain segments when a checkpoint has folded the evidence; callers may still need to
+  reconcile an ambiguous result. S3 lease deletes use native `If-Match`, never HEAD then DELETE.
+  Maintenance captures a fully materialized publication generation and pins its files while copying
+  isolated inputs. A newer refs-only snapshot must be downloaded before being used as physical input.
+
 ## 5. Working rules
+
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same
   commit — no aliases, shims, deprecated routes/keys/fields. Only bucket formats (WAL, manifest, log, checkpoint

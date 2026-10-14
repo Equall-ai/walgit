@@ -58,6 +58,10 @@ pub struct FaultPlan {
     pub p_err_after: f64,
     /// Conditional PUT/DELETE answers `PreconditionFailed` without applying.
     pub p_cas_fail: f64,
+    /// Apply conditional PUT, then surface the 412 from a lost-response retry.
+    pub cas_fail_after_apply: bool,
+    /// Refuse deletes of matching keys, modeling a bucket policy.
+    pub deny_delete_keys: Vec<String>,
     /// `get` with `if_none_match` answers `NotModified` regardless of the
     /// real version (a replica that never sees anyone else's writes).
     pub p_stale_304: f64,
@@ -185,6 +189,7 @@ pub struct FaultStore {
     inner: DynStore,
     name: String,
     plan: Mutex<FaultPlan>,
+    persistent_delete_denials: Mutex<Vec<String>>,
     rng: Mutex<Rng>,
     stats: Stats,
     /// Patterns from `panic_once_keys` already fired.
@@ -226,12 +231,17 @@ impl FaultStore {
             inner,
             name: name.into(),
             plan: Mutex::new(FaultPlan::default()),
+            persistent_delete_denials: Mutex::new(Vec::new()),
             rng: Mutex::new(Rng::new(seed)),
             stats: Stats::default(),
             fired_panics: Mutex::new(Vec::new()),
             trace: Mutex::new(None),
             gate: Mutex::new(None),
         })
+    }
+    /// Set a bucket-policy simulation that survives link healing.
+    pub fn deny_deletes(&self, patterns: Vec<String>) {
+        *self.persistent_delete_denials.lock() = patterns;
     }
     pub fn name(&self) -> &str {
         &self.name
@@ -284,6 +294,25 @@ impl FaultStore {
         }
     }
 
+    /// Pause a selected operation boundary for deterministic interleaving tests.
+    async fn wait_gate(&self, op: &str, key: &str) {
+        let gate = {
+            let mut pending = self.gate.lock();
+            if pending
+                .as_ref()
+                .is_some_and(|(operation, pattern, _)| operation == op && key.contains(pattern))
+            {
+                pending.take().map(|(_, _, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Roll the dice for one op. `mutation`: put/delete/compose; `conditional`:
     /// CAS put/delete or if-none-match get; `body_len`: for truncation.
     #[expect(
@@ -302,21 +331,7 @@ impl FaultStore {
         conditional: bool,
         read_body: bool,
     ) -> Decision {
-        let gate = {
-            let mut pending = self.gate.lock();
-            if pending
-                .as_ref()
-                .is_some_and(|(operation, pattern, _)| operation == op && key.contains(pattern))
-            {
-                pending.take().map(|(_, _, gate)| gate)
-            } else {
-                None
-            }
-        };
-        if let Some(gate) = gate {
-            gate.entered.notify_one();
-            gate.release.notified().await;
-        }
+        self.wait_gate(op, key).await;
         self.stats.ops.fetch_add(1, Ordering::Relaxed);
         let plan = self.plan.lock().clone();
         if let Some(p) = plan
@@ -482,6 +497,16 @@ impl ObjectStore for FaultStore {
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
         let conditional = !matches!(opts.mode, PutMode::Overwrite);
+        let plan = self.plan();
+        if conditional && plan.cas_fail_after_apply && Self::in_scope(&plan, key) {
+            let meta = self.inner.put(key, body, opts).await?;
+            self.wait_gate("after_put", key).await;
+            self.stats.cas_fail.fetch_add(1, Ordering::Relaxed);
+            return Err(StoreError::PreconditionFailed {
+                key: key.into(),
+                current: Some(meta.version),
+            });
+        }
         match self.decide("put", key, true, conditional, false).await {
             Decision::Hang => hang_forever().await,
             Decision::ErrBefore => Err(self.retryable("put", key, "before")),
@@ -498,6 +523,28 @@ impl ObjectStore for FaultStore {
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+        if self
+            .plan()
+            .deny_delete_keys
+            .iter()
+            .any(|pattern| key.contains(pattern))
+        {
+            self.stats.denied.fetch_add(1, Ordering::Relaxed);
+            return Err(StoreError::other(anyhow::anyhow!(
+                "delete denied by test policy: {key}"
+            )));
+        }
+        if self
+            .persistent_delete_denials
+            .lock()
+            .iter()
+            .any(|pattern| key.contains(pattern))
+        {
+            self.stats.denied.fetch_add(1, Ordering::Relaxed);
+            return Err(StoreError::other(anyhow::anyhow!(
+                "persistent delete policy: {key}"
+            )));
+        }
         let conditional = if_version.is_some();
         match self.decide("delete", key, true, conditional, false).await {
             Decision::Hang => hang_forever().await,
